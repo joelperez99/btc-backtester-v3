@@ -346,11 +346,9 @@ def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
             pct  = done / total
             name = _sname(interval, year, month)
             current = (year == now.year and month == now.month)
-            sheet_n = _sheet_idx(year) + 1
-
             if _ws_exists(name) and not current:
                 if progress_cb:
-                    progress_cb(f"✓ {interval} {year}-{month:02d} (Sheet{sheet_n}) ya guardado", pct)
+                    progress_cb(f"✓ {interval} {year}-{month:02d} ya guardado", pct)
                 continue
 
             month_start = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
