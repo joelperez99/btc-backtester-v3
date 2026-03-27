@@ -358,7 +358,7 @@ def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
             fetch_e = int(min(month_end.value // 1_000_000, now_ms))
 
             if progress_cb:
-                progress_cb(f"Descargando {interval} {year}-{month:02d} → Sheet{sheet_n}…", pct)
+                progress_cb(f"Descargando {interval} {year}-{month:02d}…", pct)
 
             new_df = fetch_klines_range(interval, fetch_s, fetch_e)
             if not new_df.empty:
