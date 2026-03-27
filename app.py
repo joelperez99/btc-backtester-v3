@@ -24,7 +24,12 @@ from google.oauth2.service_account import Credentials
 # ── Config ─────────────────────────────────────────────────────────────────────
 SYMBOL     = "BTCUSDT"
 BET_SIZE   = 10.0
-SHEET_ID   = "1B1AHIHt-yoELcL2p_7ItSeJUPYiIVW8KXFmXjB5bO50"
+# Los 3 spreadsheets rotan por año: 2020→0, 2021→1, 2022→2, 2023→0, ...
+SHEET_IDS  = [
+    "1B1AHIHt-yoELcL2p_7ItSeJUPYiIVW8KXFmXjB5bO50",  # Sheet 1
+    "1mW5QQkht3iH90RjobH_rKvl6GQyc6G0xQqbIs9YrV94",  # Sheet 2
+    "1vY4R8oPUBSJtFW0EhV-TkCCodRWHMKdGjZZwsndgYgQ",  # Sheet 3
+]
 CREDS_PATH = Path(__file__).parent / "master-plateau-489706-m4-0a4d7843f42f.json"
 SCOPES     = [
     "https://spreadsheets.google.com/feeds",
@@ -88,29 +93,39 @@ KLINE_COLS = ["open_time_ms", "open", "high", "low", "close", "volume", "close_t
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
-def get_spreadsheet():
-    """Retorna el objeto Spreadsheet (cacheado durante la sesión)."""
+def get_spreadsheet(idx: int):
+    """Retorna el Spreadsheet indicado por idx (cacheado durante la sesión)."""
     gc = gspread.authorize(_build_credentials())
-    return gc.open_by_key(SHEET_ID)
+    return gc.open_by_key(SHEET_IDS[idx])
+
+
+def _sheet_idx(year: int) -> int:
+    """Distribuye años en round-robin entre los spreadsheets disponibles."""
+    return (year - START_YEAR) % len(SHEET_IDS)
+
+
+def _ss(year: int):
+    """Devuelve el spreadsheet que le corresponde a ese año."""
+    return get_spreadsheet(_sheet_idx(year))
 
 
 def _sname(interval: str, year: int, month: int) -> str:
     return f"{interval}_{year}_{month:02d}"
 
 
-def _ws_exists(ss, name: str) -> bool:
+def _ws_exists(year: int, name: str) -> bool:
     try:
-        ss.worksheet(name)
+        _ss(year).worksheet(name)
         return True
     except gspread.exceptions.WorksheetNotFound:
         return False
 
 
-def load_month_from_sheets(ss, interval: str, year: int, month: int) -> pd.DataFrame:
-    """Carga un mes desde Google Sheets. Retorna DataFrame vacío si no existe."""
+def load_month_from_sheets(interval: str, year: int, month: int) -> pd.DataFrame:
+    """Carga un mes desde el Google Sheet que le corresponde a ese año."""
     name = _sname(interval, year, month)
     try:
-        ws   = ss.worksheet(name)
+        ws   = _ss(year).worksheet(name)
         data = ws.get_all_values()
         if len(data) <= 1:
             return pd.DataFrame()
@@ -127,11 +142,12 @@ def load_month_from_sheets(ss, interval: str, year: int, month: int) -> pd.DataF
         return pd.DataFrame()
 
 
-def save_month_to_sheets(ss, interval: str, df: pd.DataFrame,
+def save_month_to_sheets(interval: str, df: pd.DataFrame,
                           year: int, month: int, status_fn=None):
-    """Guarda (o sobrescribe) un mes completo en Google Sheets."""
+    """Guarda (o sobrescribe) un mes en el Google Sheet que le corresponde al año."""
     if df.empty:
         return
+    ss   = _ss(year)
     name = _sname(interval, year, month)
     rows = [
         [int(r["open_time"].value  // 1_000_000),
@@ -141,7 +157,7 @@ def save_month_to_sheets(ss, interval: str, df: pd.DataFrame,
         for _, r in df.iterrows()
     ]
     if status_fn:
-        status_fn(f"Guardando {interval} {year}-{month:02d} ({len(rows):,} velas)…")
+        status_fn(f"Guardando {interval} {year}-{month:02d} en Sheet{_sheet_idx(year)+1} ({len(rows):,} velas)…")
     try:
         ws = ss.worksheet(name)
         ws.clear()
@@ -151,20 +167,23 @@ def save_month_to_sheets(ss, interval: str, df: pd.DataFrame,
 
 
 def get_sheets_stats() -> dict:
-    """Retorna stats de los datos cacheados en Sheets."""
+    """Retorna stats de los datos cacheados en todos los Sheets."""
     try:
-        ss    = get_spreadsheet()
-        names = [ws.title for ws in ss.worksheets()]
+        all_dates: dict = {"1m": [], "5m": []}
+        for idx in range(len(SHEET_IDS)):
+            ss    = get_spreadsheet(idx)
+            names = [ws.title for ws in ss.worksheets()]
+            for interval in ("1m", "5m"):
+                for n in names:
+                    parts = n.split("_")
+                    if len(parts) == 3 and parts[0] == interval:
+                        try:
+                            all_dates[interval].append((int(parts[1]), int(parts[2])))
+                        except ValueError:
+                            pass
         result = {}
         for interval in ("1m", "5m"):
-            dates = []
-            for n in names:
-                parts = n.split("_")
-                if len(parts) == 3 and parts[0] == interval:
-                    try:
-                        dates.append((int(parts[1]), int(parts[2])))
-                    except ValueError:
-                        pass
+            dates = all_dates[interval]
             if dates:
                 result[interval] = {
                     "months": len(dates),
@@ -183,8 +202,8 @@ def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
     Devuelve velas para [start_ms, end_ms).
     Lee de Google Sheets cuando hay cache; descarga de Binance lo que falte.
+    Cada año va al Sheet que le corresponde según rotación round-robin.
     """
-    ss     = get_spreadsheet()
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
     start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
@@ -207,7 +226,7 @@ def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
 
     for year, month in months:
         current_month = (year == now.year and month == now.month)
-        df_cached     = load_month_from_sheets(ss, interval, year, month)
+        df_cached     = load_month_from_sheets(interval, year, month)
 
         if not df_cached.empty:
             if not current_month:
@@ -226,7 +245,7 @@ def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
                            .drop_duplicates("open_time")
                            .sort_values("open_time")
                            .reset_index(drop=True))
-                save_month_to_sheets(ss, interval, df_full, year, month)
+                save_month_to_sheets(interval, df_full, year, month)
                 all_dfs.append(df_full)
             else:
                 all_dfs.append(df_cached)
@@ -245,7 +264,7 @@ def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
 
         new_df = fetch_klines_range(interval, fetch_s, fetch_e)
         if not new_df.empty:
-            save_month_to_sheets(ss, interval, new_df, year, month)
+            save_month_to_sheets(interval, new_df, year, month)
             all_dfs.append(new_df)
         time.sleep(0.3)  # margen para API de Sheets
 
@@ -265,7 +284,6 @@ def fetch_and_cache(interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
 
 def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
     """Descarga todos los meses desde start_year hasta hoy y los guarda en Sheets."""
-    ss     = get_spreadsheet()
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     now    = datetime.now(tz=timezone.utc)
     counts = {"1m": 0, "5m": 0}
@@ -285,10 +303,11 @@ def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
             pct  = done / total
             name = _sname(interval, year, month)
             current = (year == now.year and month == now.month)
+            sheet_n = _sheet_idx(year) + 1
 
-            if _ws_exists(ss, name) and not current:
+            if _ws_exists(year, name) and not current:
                 if progress_cb:
-                    progress_cb(f"✓ {interval} {year}-{month:02d} ya guardado", pct)
+                    progress_cb(f"✓ {interval} {year}-{month:02d} (Sheet{sheet_n}) ya guardado", pct)
                 continue
 
             month_start = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
@@ -298,11 +317,11 @@ def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
             fetch_e = int(min(month_end.value // 1_000_000, now_ms))
 
             if progress_cb:
-                progress_cb(f"Descargando {interval} {year}-{month:02d}…", pct)
+                progress_cb(f"Descargando {interval} {year}-{month:02d} → Sheet{sheet_n}…", pct)
 
             new_df = fetch_klines_range(interval, fetch_s, fetch_e)
             if not new_df.empty:
-                save_month_to_sheets(ss, interval, new_df, year, month)
+                save_month_to_sheets(interval, new_df, year, month)
                 counts[interval] += len(new_df)
             time.sleep(1.0)
 
@@ -311,14 +330,13 @@ def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
 
 def update_current_month(progress_cb=None) -> dict:
     """Actualiza solo el mes actual en Google Sheets."""
-    ss     = get_spreadsheet()
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     now    = datetime.now(tz=timezone.utc)
     counts = {"1m": 0, "5m": 0}
 
     for interval in ("1m", "5m"):
         year, month  = now.year, now.month
-        df_cached    = load_month_from_sheets(ss, interval, year, month)
+        df_cached    = load_month_from_sheets(interval, year, month)
         month_start  = pd.Timestamp(year=year, month=month, day=1, tz="UTC")
 
         if not df_cached.empty:
@@ -338,7 +356,7 @@ def update_current_month(progress_cb=None) -> dict:
                            .reset_index(drop=True))
             else:
                 df_full = new_df
-            save_month_to_sheets(ss, interval, df_full, year, month)
+            save_month_to_sheets(interval, df_full, year, month)
             counts[interval] = len(new_df)
 
         if progress_cb:
