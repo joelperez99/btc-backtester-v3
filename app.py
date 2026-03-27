@@ -99,55 +99,54 @@ def get_spreadsheet(idx: int):
     return gc.open_by_key(SHEET_IDS[idx])
 
 
-def _sheet_idx(year: int) -> int:
-    """Distribuye años en round-robin entre los spreadsheets disponibles."""
-    return (year - START_YEAR) % len(SHEET_IDS)
-
-
-def _ss(year: int):
-    """Devuelve el spreadsheet que le corresponde a ese año."""
-    return get_spreadsheet(_sheet_idx(year))
-
-
 def _sname(interval: str, year: int, month: int) -> str:
     return f"{interval}_{year}_{month:02d}"
 
 
-def _ws_exists(year: int, name: str) -> bool:
-    try:
-        _ss(year).worksheet(name)
-        return True
-    except gspread.exceptions.WorksheetNotFound:
-        return False
+def _df_from_ws(ws) -> pd.DataFrame:
+    """Convierte un worksheet de velas a DataFrame."""
+    data = ws.get_all_values()
+    if len(data) <= 1:
+        return pd.DataFrame()
+    df = pd.DataFrame(data[1:], columns=data[0])
+    for c in KLINE_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df.dropna(subset=["open_time_ms"], inplace=True)
+    df = df.astype({"open_time_ms": "int64", "close_time_ms": "int64"})
+    df["open_time"]  = pd.to_datetime(df["open_time_ms"],  unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time_ms"], unit="ms", utc=True)
+    return (df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
+            .reset_index(drop=True))
 
 
 def load_month_from_sheets(interval: str, year: int, month: int) -> pd.DataFrame:
-    """Carga un mes desde el Google Sheet que le corresponde a ese año."""
+    """
+    Busca el mes en TODOS los sheets (en orden) y retorna el primero que lo tenga.
+    Retorna DataFrame vacío si no se encuentra en ninguno.
+    """
     name = _sname(interval, year, month)
-    try:
-        ws   = _ss(year).worksheet(name)
-        data = ws.get_all_values()
-        if len(data) <= 1:
-            return pd.DataFrame()
-        df = pd.DataFrame(data[1:], columns=data[0])
-        for c in KLINE_COLS:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df.dropna(subset=["open_time_ms"], inplace=True)
-        df = df.astype({"open_time_ms": "int64", "close_time_ms": "int64"})
-        df["open_time"]  = pd.to_datetime(df["open_time_ms"],  unit="ms", utc=True)
-        df["close_time"] = pd.to_datetime(df["close_time_ms"], unit="ms", utc=True)
-        return (df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
-                .reset_index(drop=True))
-    except gspread.exceptions.WorksheetNotFound:
-        return pd.DataFrame()
+    for idx in range(len(SHEET_IDS)):
+        try:
+            ws = get_spreadsheet(idx).worksheet(name)
+            df = _df_from_ws(ws)
+            if not df.empty:
+                return df
+        except gspread.exceptions.WorksheetNotFound:
+            continue
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 
 def save_month_to_sheets(interval: str, df: pd.DataFrame,
                           year: int, month: int, status_fn=None):
-    """Guarda (o sobrescribe) un mes en el Google Sheet que le corresponde al año."""
+    """
+    Guarda un mes en Google Sheets.
+    - Si ya existe en algún sheet, sobrescribe ahí.
+    - Si no existe, intenta crear en Sheet1; si está lleno, prueba Sheet2, luego Sheet3.
+    """
     if df.empty:
         return
-    ss   = _ss(year)
     name = _sname(interval, year, month)
     rows = [
         [int(r["open_time"].value  // 1_000_000),
@@ -156,42 +155,86 @@ def save_month_to_sheets(interval: str, df: pd.DataFrame,
          int(r["close_time"].value // 1_000_000)]
         for _, r in df.iterrows()
     ]
-    if status_fn:
-        status_fn(f"Guardando {interval} {year}-{month:02d} en Sheet{_sheet_idx(year)+1} ({len(rows):,} velas)…")
-    try:
-        ws = ss.worksheet(name)
-        ws.clear()
-    except gspread.exceptions.WorksheetNotFound:
-        ws = ss.add_worksheet(title=name, rows=len(rows) + 5, cols=7)
-    ws.update([KLINE_COLS] + rows, value_input_option="RAW")
+
+    # 1. Buscar si ya existe en algún sheet → sobrescribir ahí
+    for idx in range(len(SHEET_IDS)):
+        try:
+            ss = get_spreadsheet(idx)
+            ws = ss.worksheet(name)
+            if status_fn:
+                status_fn(f"Actualizando {interval} {year}-{month:02d} en Sheet{idx+1} ({len(rows):,} velas)…")
+            ws.clear()
+            ws.update([KLINE_COLS] + rows, value_input_option="RAW")
+            return
+        except gspread.exceptions.WorksheetNotFound:
+            continue
+        except Exception:
+            continue
+
+    # 2. No existe → crear en el primer sheet que tenga espacio
+    for idx in range(len(SHEET_IDS)):
+        try:
+            ss = get_spreadsheet(idx)
+            if status_fn:
+                status_fn(f"Guardando {interval} {year}-{month:02d} en Sheet{idx+1} ({len(rows):,} velas)…")
+            ws = ss.add_worksheet(title=name, rows=len(rows) + 5, cols=7)
+            ws.update([KLINE_COLS] + rows, value_input_option="RAW")
+            return
+        except Exception:
+            # Sheet lleno o inaccesible → intentar el siguiente
+            continue
+
+    raise RuntimeError("Todos los Google Sheets están llenos o inaccesibles.")
+
+
+def _ws_exists(name: str) -> bool:
+    """Retorna True si la hoja existe en cualquiera de los sheets."""
+    for idx in range(len(SHEET_IDS)):
+        try:
+            get_spreadsheet(idx).worksheet(name)
+            return True
+        except gspread.exceptions.WorksheetNotFound:
+            continue
+        except Exception:
+            continue
+    return False
 
 
 def get_sheets_stats() -> dict:
     """Retorna stats de los datos cacheados en todos los Sheets."""
     try:
         all_dates: dict = {"1m": [], "5m": []}
+        sheet_counts = []
         for idx in range(len(SHEET_IDS)):
-            ss    = get_spreadsheet(idx)
-            names = [ws.title for ws in ss.worksheets()]
-            for interval in ("1m", "5m"):
+            try:
+                ss    = get_spreadsheet(idx)
+                names = [ws.title for ws in ss.worksheets()]
+                cnt   = 0
                 for n in names:
                     parts = n.split("_")
-                    if len(parts) == 3 and parts[0] == interval:
+                    if len(parts) == 3 and parts[0] in ("1m", "5m"):
                         try:
-                            all_dates[interval].append((int(parts[1]), int(parts[2])))
+                            all_dates[parts[0]].append((int(parts[1]), int(parts[2])))
+                            cnt += 1
                         except ValueError:
                             pass
+                sheet_counts.append(cnt)
+            except Exception:
+                sheet_counts.append(0)
+
         result = {}
         for interval in ("1m", "5m"):
             dates = all_dates[interval]
             if dates:
                 result[interval] = {
-                    "months": len(dates),
-                    "min":    f"{min(dates)[0]}-{min(dates)[1]:02d}",
-                    "max":    f"{max(dates)[0]}-{max(dates)[1]:02d}",
+                    "months":       len(dates),
+                    "min":          f"{min(dates)[0]}-{min(dates)[1]:02d}",
+                    "max":          f"{max(dates)[0]}-{max(dates)[1]:02d}",
+                    "sheet_counts": sheet_counts,
                 }
             else:
-                result[interval] = {"months": 0, "min": None, "max": None}
+                result[interval] = {"months": 0, "min": None, "max": None,
+                                    "sheet_counts": sheet_counts}
         return result
     except Exception as ex:
         return {"1m": {"months": 0, "error": str(ex)},
@@ -305,7 +348,7 @@ def download_history(start_year: int = START_YEAR, progress_cb=None) -> dict:
             current = (year == now.year and month == now.month)
             sheet_n = _sheet_idx(year) + 1
 
-            if _ws_exists(year, name) and not current:
+            if _ws_exists(name) and not current:
                 if progress_cb:
                     progress_cb(f"✓ {interval} {year}-{month:02d} (Sheet{sheet_n}) ya guardado", pct)
                 continue
@@ -1227,14 +1270,16 @@ with st.sidebar:
 
     try:
         gs_stats = get_sheets_stats()
-        def _fmt_ym(v):
-            return v if v else "—"
+        def _fmt_ym(v): return v if v else "—"
+        sc = gs_stats["1m"].get("sheet_counts", [0]*len(SHEET_IDS))
+        sheets_detail = " | ".join(f"S{i+1}:{sc[i]}" for i in range(len(SHEET_IDS)))
         st.markdown(
             f"<div style='font-size:11px;color:#8a8daa;line-height:1.8;'>"
             f"🕐 1m: <b style='color:#e8eaf6;'>{gs_stats['1m']['months']}</b> meses"
-            f" &nbsp;|&nbsp; {_fmt_ym(gs_stats['1m'].get('min'))} → {_fmt_ym(gs_stats['1m'].get('max'))}<br>"
+            f" &nbsp;({_fmt_ym(gs_stats['1m'].get('min'))} → {_fmt_ym(gs_stats['1m'].get('max'))})<br>"
             f"📊 5m: <b style='color:#e8eaf6;'>{gs_stats['5m']['months']}</b> meses"
-            f" &nbsp;|&nbsp; {_fmt_ym(gs_stats['5m'].get('min'))} → {_fmt_ym(gs_stats['5m'].get('max'))}"
+            f" &nbsp;({_fmt_ym(gs_stats['5m'].get('min'))} → {_fmt_ym(gs_stats['5m'].get('max'))})<br>"
+            f"<span style='color:#6e7191;'>Hojas: {sheets_detail}</span>"
             f"</div>", unsafe_allow_html=True)
     except Exception as e:
         st.warning(f"Error conectando a Sheets: {e}")
