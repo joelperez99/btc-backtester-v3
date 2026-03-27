@@ -38,12 +38,22 @@ def _build_credentials() -> Credentials:
     """
     Carga credenciales desde st.secrets (Streamlit Cloud)
     o desde el archivo JSON local (desarrollo).
+
+    En Streamlit Cloud usar:
+        [gcp_service_account]
+        json_str = '<contenido completo del JSON en una sola línea>'
     """
     if "gcp_service_account" in st.secrets:
-        info = dict(st.secrets["gcp_service_account"])
-        # Restaurar saltos de línea en private_key si vienen escapados
-        if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        import json as _json
+        sec = st.secrets["gcp_service_account"]
+        if "json_str" in sec:
+            # Método recomendado: JSON completo como string (evita problemas con \n)
+            info = _json.loads(sec["json_str"])
+        else:
+            # Método campo por campo (arreglar \n en private_key)
+            info = {k: v for k, v in sec.items()}
+            if "private_key" in info:
+                info["private_key"] = info["private_key"].replace("\\n", "\n")
         return Credentials.from_service_account_info(info, scopes=SCOPES)
     # Fallback: JSON local
     return Credentials.from_service_account_file(str(CREDS_PATH), scopes=SCOPES)
